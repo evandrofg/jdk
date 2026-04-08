@@ -48,6 +48,8 @@ double ZAdaptiveHeap::_accumulated_young_gc_time = 0.0;
 ZAdaptiveHeap::ZGenerationOverhead ZAdaptiveHeap::_young_data;
 ZAdaptiveHeap::ZGenerationOverhead ZAdaptiveHeap::_old_data;
 Atomic<uint> ZAdaptiveHeap::_initial_young_worker_cap;
+ZAdaptiveHeap::ZSqrtSizerState ZAdaptiveHeap::_sqrt_young_state;
+ZAdaptiveHeap::ZSqrtSizerState ZAdaptiveHeap::_sqrt_old_state;
 
 static ZLock* _stat_lock;
 
@@ -651,6 +653,185 @@ static double smoothing_function(double value, double warmness) {
   return sigmoid * warmness + aggressive * (1.0 - warmness);
 }
 
+// Square-root heap sizing policy based on:
+//   "Optimal Heap Limits for Reducing Browser Memory Use" (OOPSLA 2022)
+//   https://dl.acm.org/doi/10.1145/3563323
+//
+// The paper derives that the heap limit minimising the product of average
+// memory use and GC overhead is:
+//
+//   M = L + sqrt(L * g / (c * s))
+//
+// where L is live bytes after GC, g is the allocation rate [bytes/s], c is
+// the target GC CPU overhead fraction, and s is GC throughput [bytes/CPU-s].
+//
+// Substituting s = L / T_gc (GC throughput in terms of CPU time) the L terms
+// cancel, giving the equivalent headroom:
+//
+//   E_sqrt = sqrt(g * T_gc * MiB / c)
+//
+// The MiB factor (1 048 576) is required for dimensional consistency: the
+// paper works in MB units so its formula produces a result in MB; converting
+// all inputs to raw bytes requires multiplying the sqrt argument by 1 MiB so
+// the result is in bytes.  Without it the headroom is ~1024x too small.
+//
+// Exponentially weighted moving averages are applied to all three inputs
+// following the smoothing parameters recommended by the paper:
+//   alpha_alloc = 0.95  (~13-second half-life, tracks allocation bursts slowly)
+//   alpha_gc    = 0.50  (faster response to GC-time changes)
+//
+// The same ZGCIntensity knob controls the target GC overhead c:
+//   c = ZGCIntensity / 40.0   (consistent with the pressure-based algorithm)
+//
+// This function is called once per generation after every pressure-triggered
+// GC cycle and returns a new total-heap heuristic capacity.
+//
+// ── EWMA state update (shared with Policy 2) ─────────────────────────────
+void ZAdaptiveHeap::update_sqrt_state(ZSqrtSizerState& state,
+                                      size_t live, double gc_cpu_time, double alloc_rate) {
+  const double alpha_alloc = 0.95;
+  const double alpha_gc    = 0.50;
+
+  if (state._avg_live_bytes == 0.0) {
+    // First call: seed directly so the estimate isn't dragged toward zero.
+    state._avg_live_bytes  = double(live);
+    state._avg_gc_cpu_time = gc_cpu_time;
+    state._avg_alloc_rate  = alloc_rate;
+  } else {
+    state._avg_live_bytes  = alpha_gc    * state._avg_live_bytes  + (1.0 - alpha_gc)    * double(live);
+    state._avg_gc_cpu_time = alpha_gc    * state._avg_gc_cpu_time + (1.0 - alpha_gc)    * gc_cpu_time;
+    state._avg_alloc_rate  = alpha_alloc * state._avg_alloc_rate  + (1.0 - alpha_alloc) * alloc_rate;
+  }
+}
+
+size_t ZAdaptiveHeap::compute_heap_size_sqrt(ZHeapResizeMetrics* heap_metrics,
+                                              ZGenerationId generation) {
+  ZStatCycleStats cycle_stats = ZGeneration::generation(generation)->stat_cycle()->stats();
+
+  // L: live bytes for this generation at mark end.
+  const size_t live = ZGeneration::generation(generation)->stat_heap()->live_at_mark_end();
+
+  // T_gc: total CPU time consumed by this generation's last GC cycle.
+  const double gc_cpu_time = cycle_stats._last_total_vtime;
+
+  // g: mutator allocation rate [bytes / wall-clock second].
+  const double alloc_rate = heap_metrics->_alloc_rate;
+
+  ZSqrtSizerState& state = (generation == ZGenerationId::young)
+      ? _sqrt_young_state
+      : _sqrt_old_state;
+
+  update_sqrt_state(state, live, gc_cpu_time, alloc_rate);
+
+  // c: target GC CPU overhead — same knob as the pressure-based algorithm.
+  const double target_gc_overhead = AtomicAccess::load(&ZGCIntensity) / 40.0;
+
+  // E_sqrt = sqrt(g * T_gc * MiB / c), with a 2 MB floor from the paper.
+  const size_t e_min = 2 * M;
+  size_t extra = e_min;
+  if (state._avg_gc_cpu_time > 0.0 && target_gc_overhead > 0.0) {
+    const double E = sqrt(state._avg_alloc_rate * state._avg_gc_cpu_time * double(M) / target_gc_overhead);
+    if (size_t(E) > extra) {
+      extra = size_t(E);
+    }
+  }
+
+  const size_t new_capacity = align_up(size_t(state._avg_live_bytes) + extra, ZGranuleSize);
+  const size_t upper_bound  = MIN2(heap_metrics->_soft_max_capacity, heap_metrics->_current_max_capacity);
+  const size_t lower_bound  = heap_metrics->_static_min_capacity;
+  const size_t result       = clamp(new_capacity, lower_bound, upper_bound);
+
+  if (can_adapt()) {
+    log_info(gc, heap)("Sqrt: Live: %zuM, AllocRate: %.1fMB/s, GC CPU: %.3fs, Extra: %zuM -> Capacity: %zuM",
+                       size_t(state._avg_live_bytes) / M,
+                       state._avg_alloc_rate / M,
+                       state._avg_gc_cpu_time,
+                       extra / M,
+                       result / M);
+  }
+
+  return result;
+}
+
+// Policy 2: combined sqrt + stall-prevention floor (Idea G).
+//
+// Preserves the Kirisame multi-tenant property: both headroom terms depend
+// only on the JVM's own (g, T_gc, L, c) — not on system RAM — so the shared
+// constant c still acts as a global price signal across JVMs.
+//
+// Two terms compete to set the headroom:
+//
+//   E_sqrt  = sqrt(g * T_gc_cpu * MiB / c)
+//             — Kirisame CPU-efficiency target (units-fixed).
+//
+//   E_stall = g * T_gc_wall
+//             — minimum headroom needed to absorb one GC cycle's worth of
+//               allocation without a stall.  One GC cycle takes T_gc_wall
+//               wall-seconds; in that time the mutator allocates g * T_gc_wall
+//               bytes.  T_gc_wall = T_gc_cpu / active_workers + serial_time.
+//
+// headroom = max(E_sqrt, E_stall, 2 MB)
+// M        = L + headroom
+//
+// When g/s <= 1 (GC keeps pace) E_stall <= L so E_sqrt typically dominates
+// and the formula reduces to the pure Kirisame result.  When g/s > 1 (GC
+// falls behind) E_stall > L grows proportionally, naturally increasing the
+// heap without appealing to system memory pressure.
+size_t ZAdaptiveHeap::compute_heap_size_combined(ZHeapResizeMetrics* heap_metrics,
+                                                  ZGenerationId generation) {
+  ZStatCycleStats cycle_stats = ZGeneration::generation(generation)->stat_cycle()->stats();
+
+  const size_t live      = ZGeneration::generation(generation)->stat_heap()->live_at_mark_end();
+  const double gc_cpu_time  = cycle_stats._last_total_vtime;
+  const double alloc_rate   = heap_metrics->_alloc_rate;
+
+  ZSqrtSizerState& state = (generation == ZGenerationId::young)
+      ? _sqrt_young_state
+      : _sqrt_old_state;
+
+  update_sqrt_state(state, live, gc_cpu_time, alloc_rate);
+
+  const double target_gc_overhead = AtomicAccess::load(&ZGCIntensity) / 40.0;
+
+  // E_sqrt: units-fixed Kirisame headroom.
+  const size_t e_min = 2 * M;
+  size_t e_sqrt = e_min;
+  if (state._avg_gc_cpu_time > 0.0 && target_gc_overhead > 0.0) {
+    const double E = sqrt(state._avg_alloc_rate * state._avg_gc_cpu_time * double(M) / target_gc_overhead);
+    if (size_t(E) > e_sqrt) {
+      e_sqrt = size_t(E);
+    }
+  }
+
+  // E_stall: allocation absorbed during one GC wall-clock cycle.
+  // T_gc_wall = T_gc_cpu / active_workers + serial_time.
+  const double active_workers = MAX2(cycle_stats._last_active_workers, 1.0);
+  const double gc_wall_time   = state._avg_gc_cpu_time / active_workers
+                              + cycle_stats._avg_serial_time;
+  const size_t e_stall = size_t(state._avg_alloc_rate * gc_wall_time);
+
+  const size_t extra        = MAX2(e_sqrt, e_stall);
+  const size_t new_capacity = align_up(size_t(state._avg_live_bytes) + extra, ZGranuleSize);
+  const size_t upper_bound  = MIN2(heap_metrics->_soft_max_capacity, heap_metrics->_current_max_capacity);
+  const size_t lower_bound  = heap_metrics->_static_min_capacity;
+  const size_t result       = clamp(new_capacity, lower_bound, upper_bound);
+
+  if (can_adapt()) {
+    const char* dominant = (e_stall > e_sqrt) ? "stall" : "sqrt";
+    log_info(gc, heap)("Combined [%s]: Live: %zuM, AllocRate: %.1fMB/s, "
+                       "GC CPU: %.3fs, Wall: %.3fs, Extra: %zuM -> Capacity: %zuM",
+                       dominant,
+                       size_t(state._avg_live_bytes) / M,
+                       state._avg_alloc_rate / M,
+                       state._avg_gc_cpu_time,
+                       gc_wall_time,
+                       extra / M,
+                       result / M);
+  }
+
+  return result;
+}
+
 size_t ZAdaptiveHeap::compute_heap_size(ZHeapResizeMetrics* heap_metrics, ZGenerationId generation) {
   precond(_initialized);
 
@@ -664,6 +845,36 @@ size_t ZAdaptiveHeap::compute_heap_size(ZHeapResizeMetrics* heap_metrics, ZGener
   if (!is_heap_pressure_gc) {
     // If this isn't a GC pressure triggered GC, don't resize or learn anything
     return heap_metrics->_heuristic_max_capacity;
+  }
+
+  // Square-root and combined policies: avoid the expensive pressure metric
+  // gathering and dispatch directly.  The proactive shrink step is preserved.
+  if (ZHeapSizingPolicy == 1 || ZHeapSizingPolicy == 2) {
+    if (is_heap_anti_pressure_gc) {
+      const size_t selected_capacity = MAX2(size_t(double(heap_metrics->_heuristic_max_capacity) * 0.95),
+                                           heap_metrics->_used);
+      return clamp(align_down(selected_capacity, ZGranuleSize),
+                   heap_metrics->_static_min_capacity,
+                   heap_metrics->_current_max_capacity);
+    }
+
+    // The Kirisame formula is designed around the old-generation live set (L).
+    // Young-generation live bytes are near zero by definition (most young
+    // objects die before mark end), which degenerates the formula to the 2 MB
+    // floor.  With a 3 GB/s allocation rate and an 8 MB heap the JVM would GC
+    // ~375 times per second, completely dominating mutator time.
+    //
+    // Only run the formula after a major (old-gen) GC, where L is the
+    // persistent live data and the result is meaningful.  For young GCs, leave
+    // the current heap target unchanged; the next major GC will resize.
+    if (generation == ZGenerationId::young) {
+      return heap_metrics->_heuristic_max_capacity;
+    }
+
+    if (ZHeapSizingPolicy == 1) {
+      return compute_heap_size_sqrt(heap_metrics, generation);
+    }
+    return compute_heap_size_combined(heap_metrics, generation);
   }
 
   // System memory load

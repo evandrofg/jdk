@@ -126,6 +126,13 @@
   product(bool, ZAdaptWithExplicitMaxCapacity, true,                        \
           "REMOVE ME")                                                      \
                                                                             \
+  product(uint, ZHeapSizingPolicy, 0,                                       \
+          "Heap sizing policy for ZGC automatic heap sizing: "              \
+          "0: Pressure-based (CPU, memory, and latency pressure, default) " \
+          "1: Square-root formula (Optimal Heap Limits paper) "            \
+          "2: Combined sqrt + stall-prevention floor (multi-tenant safe)")  \
+          range(0, 2)                                                       \
+                                                                            \
   develop(bool, ZVerifyOops, false,                                         \
           "Verify accessed oops")                                           \
                                                                             \

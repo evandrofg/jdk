@@ -116,12 +116,33 @@ private:
   static ZGenerationOverhead _old_data;
   static Atomic<uint> _initial_young_worker_cap;
 
+  // Per-generation EWMA state for the square-root heap sizing policy.
+  // Tracks smoothed live bytes, GC CPU time, and allocation rate following
+  // the smoothing parameters from the "Optimal Heap Limits" paper.
+  struct ZSqrtSizerState {
+    double _avg_live_bytes;
+    double _avg_gc_cpu_time;
+    double _avg_alloc_rate;
+
+    ZSqrtSizerState()
+      : _avg_live_bytes(0.0),
+        _avg_gc_cpu_time(0.0),
+        _avg_alloc_rate(0.0) {}
+  };
+
+  static ZSqrtSizerState _sqrt_young_state;
+  static ZSqrtSizerState _sqrt_old_state;
+
   static ZCpuPressureMetrics cpu_pressure_metrics(ZGenerationId generation);
 
   static ZResourcePressure compute_pressures(const ZMemoryPressureMetrics& mem_metrics,
                                              const ZCpuPressureMetrics& cpu_metrics,
                                              size_t projected_process_used_memory);
   static double compute_memory_pressure(const ZMemoryPressureMetrics& metrics);
+
+  static void   update_sqrt_state(ZSqrtSizerState& state, size_t live, double gc_cpu_time, double alloc_rate);
+  static size_t compute_heap_size_sqrt(ZHeapResizeMetrics* metrics, ZGenerationId generation);
+  static size_t compute_heap_size_combined(ZHeapResizeMetrics* metrics, ZGenerationId generation);
 
 public:
   static void initialize(bool explicit_max_heap_size, bool can_adapt);
