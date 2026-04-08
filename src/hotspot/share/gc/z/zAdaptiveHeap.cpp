@@ -753,30 +753,47 @@ size_t ZAdaptiveHeap::compute_heap_size_sqrt(ZHeapResizeMetrics* heap_metrics,
   return result;
 }
 
-// Policy 2: combined sqrt + stall-prevention floor (Idea G).
+// Policy 2: combined sqrt + stall-prevention floor + GC-frequency floor (Idea G+).
 //
-// Preserves the Kirisame multi-tenant property: both headroom terms depend
+// Preserves the Kirisame multi-tenant property: all three headroom terms depend
 // only on the JVM's own (g, T_gc, L, c) — not on system RAM — so the shared
 // constant c still acts as a global price signal across JVMs.
 //
-// Two terms compete to set the headroom:
+// Three terms compete to set the headroom:
 //
 //   E_sqrt  = sqrt(g * T_gc_cpu * MiB / c)
 //             — Kirisame CPU-efficiency target (units-fixed).
+//             Optimises GC CPU overhead across a shared machine.
 //
 //   E_stall = g * T_gc_wall
-//             — minimum headroom needed to absorb one GC cycle's worth of
-//               allocation without a stall.  One GC cycle takes T_gc_wall
-//               wall-seconds; in that time the mutator allocates g * T_gc_wall
-//               bytes.  T_gc_wall = T_gc_cpu / active_workers + serial_time.
+//             — stall-prevention floor: headroom needed to absorb one GC
+//               cycle's worth of allocation without a mutator stall.
+//               T_gc_wall = T_gc_cpu / active_workers + serial_time.
+//               Dominates for workloads with g/s > 1 (large live set, slow GC).
 //
-// headroom = max(E_sqrt, E_stall, 2 MB)
+//   E_floor = g * min(T_gc_cpu, T_base) / c,   T_base = c * T_min (50 ms)
+//             — GC-frequency floor: analogous to E_freq but with T_gc_cpu
+//               capped at T_base = c * T_min_interval.
+//
+//               Without the cap, E_freq = g * T_gc_cpu / c overshoots badly
+//               for workloads with long GC CPU time (e.g. h2: T_gc_cpu ≈ 800ms
+//               → E_freq ≈ 15 GB for a 32 GB machine, forcing max heap).
+//
+//               With T_min = 50 ms, T_base = 0.125 * 50ms = 6.25 ms:
+//                 h2:       T_gc_cpu=800ms > T_base=6.25ms → E_floor=123 MB
+//                           E_stall=2260 MB dominates → old behaviour preserved
+//                 luindex:  T_gc_cpu=7ms   > T_base=6.25ms → E_floor=133 MB
+//                           floor dominates → Linux fix (was 21 MB without it)
+//
+//               E_floor is multi-tenant safe: proportional to g_i with shared c.
+//
+// headroom = max(E_sqrt, E_stall, E_floor, 2 MB)
 // M        = L + headroom
 //
-// When g/s <= 1 (GC keeps pace) E_stall <= L so E_sqrt typically dominates
-// and the formula reduces to the pure Kirisame result.  When g/s > 1 (GC
-// falls behind) E_stall > L grows proportionally, naturally increasing the
-// heap without appealing to system memory pressure.
+// Typical dominance:
+//   g/s > 1, few workers (macOS): E_stall dominates.
+//   g/s ≤ 1, many workers (Linux x86): E_floor dominates.
+//   Low-activity workloads:  2 MB floor.
 size_t ZAdaptiveHeap::compute_heap_size_combined(ZHeapResizeMetrics* heap_metrics,
                                                   ZGenerationId generation) {
   ZStatCycleStats cycle_stats = ZGeneration::generation(generation)->stat_cycle()->stats();
@@ -810,14 +827,48 @@ size_t ZAdaptiveHeap::compute_heap_size_combined(ZHeapResizeMetrics* heap_metric
                               + cycle_stats._avg_serial_time;
   const size_t e_stall = size_t(state._avg_alloc_rate * gc_wall_time);
 
-  const size_t extra        = MAX2(e_sqrt, e_stall);
+  // E_floor: GC-frequency floor with capped T_gc_cpu.
+  // On many-core machines T_gc_wall << T_gc_cpu, so E_stall becomes negligible
+  // even though hundreds of major GC cycles per second can occur (e.g. luindex
+  // on Linux x86 with 8 workers: T_gc_wall=7ms/8=0.875ms → E_stall≈4 MB).
+  //
+  // Naïve fix E_freq = g * T_gc_cpu / c overshoots badly for workloads with
+  // long GC CPU time: h2 has T_gc_cpu≈800ms → E_freq≈15 GB on a 32 GB machine.
+  //
+  // E_floor = g * min(T_gc_cpu, T_base) / c,  T_base = c * T_min_interval
+  //
+  // T_base = c * T_min caps the effective GC time so that:
+  //   - Slow-GC workloads (T_gc_cpu > T_base): capped at T_base, preventing
+  //     over-allocation. h2: T_gc_cpu=800ms > T_base=62.5ms → T_eff=62.5ms.
+  //   - Fast-GC workloads (T_gc_cpu < T_base): uncapped, full E_floor applies.
+  //     luindex Linux (8 workers): T_gc_cpu≈57ms < T_base=62.5ms → T_eff=57ms
+  //     → E_floor = g*57ms/c ≈ 256 MB (vs E_stall≈4 MB → floor dominates). ✓
+  //     luindex macOS (2 workers): T_gc_cpu≈7ms < T_base=62.5ms → T_eff=7ms
+  //     → E_floor = g*7ms/c ≈ 28 MB (minimal change from old 6.25ms cap). ✓
+  //
+  // T_min = 500ms chosen so that T_base = 62.5ms sits just above the ~57ms
+  // GC CPU time of fast-GC/many-core workloads on 8-core Linux, letting them
+  // use their real T_gc_cpu without the cap.
+  //
+  // Multi-tenant safe: E_floor = g_i * min(T_cpu_i, T_base) / c, proportional
+  // to each JVM's own workload with the shared constant c.
+  const double T_min_interval = 0.500;  // 500 ms: T_base = c * 500ms = 62.5ms
+  const double T_base  = target_gc_overhead * T_min_interval;
+  const double T_eff   = MIN2(state._avg_gc_cpu_time, T_base);
+  const size_t e_floor = (target_gc_overhead > 0.0)
+      ? size_t(state._avg_alloc_rate * T_eff / target_gc_overhead)
+      : size_t(0);
+
+  const size_t extra        = MAX3(e_sqrt, e_stall, e_floor);
   const size_t new_capacity = align_up(size_t(state._avg_live_bytes) + extra, ZGranuleSize);
   const size_t upper_bound  = MIN2(heap_metrics->_soft_max_capacity, heap_metrics->_current_max_capacity);
   const size_t lower_bound  = heap_metrics->_static_min_capacity;
   const size_t result       = clamp(new_capacity, lower_bound, upper_bound);
 
   if (can_adapt()) {
-    const char* dominant = (e_stall > e_sqrt) ? "stall" : "sqrt";
+    const char* dominant = (e_floor >= e_stall && e_floor >= e_sqrt) ? "floor"
+                         : (e_stall >= e_sqrt)                      ? "stall"
+                                                                    : "sqrt";
     log_info(gc, heap)("Combined [%s]: Live: %zuM, AllocRate: %.1fMB/s, "
                        "GC CPU: %.3fs, Wall: %.3fs, Extra: %zuM -> Capacity: %zuM",
                        dominant,
