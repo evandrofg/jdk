@@ -123,11 +123,22 @@ private:
     double _avg_live_bytes;
     double _avg_gc_cpu_time;
     double _avg_alloc_rate;
+    // Peak-hold wall time and allocation rate, each with slow exponential
+    // decay. EWMAs of these signals are dominated by fast uncontested cycles,
+    // which hides the burst conditions E_stall must react to: brief windows
+    // where the mutator allocates at 5–10 GB/s while GC wall time stretches
+    // under CPU contention. Peak-hold captures the worst observed value and
+    // decays it over ~40 cycles so E_stall stays elevated across the burst
+    // window instead of collapsing between spikes.
+    double _peak_gc_wall_time;
+    double _peak_alloc_rate;
 
     ZSqrtSizerState()
       : _avg_live_bytes(0.0),
         _avg_gc_cpu_time(0.0),
-        _avg_alloc_rate(0.0) {}
+        _avg_alloc_rate(0.0),
+        _peak_gc_wall_time(0.0),
+        _peak_alloc_rate(0.0) {}
   };
 
   static ZSqrtSizerState _sqrt_young_state;
@@ -140,7 +151,7 @@ private:
                                              size_t projected_process_used_memory);
   static double compute_memory_pressure(const ZMemoryPressureMetrics& metrics);
 
-  static void   update_sqrt_state(ZSqrtSizerState& state, size_t live, double gc_cpu_time, double alloc_rate);
+  static void   update_sqrt_state(ZSqrtSizerState& state, size_t live, double gc_cpu_time, double alloc_rate, double gc_wall_time);
   static size_t compute_heap_size_sqrt(ZHeapResizeMetrics* metrics, ZGenerationId generation);
   static size_t compute_heap_size_combined(ZHeapResizeMetrics* metrics, ZGenerationId generation);
 

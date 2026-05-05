@@ -688,19 +688,28 @@ static double smoothing_function(double value, double warmness) {
 //
 // ── EWMA state update (shared with Policy 2) ─────────────────────────────
 void ZAdaptiveHeap::update_sqrt_state(ZSqrtSizerState& state,
-                                      size_t live, double gc_cpu_time, double alloc_rate) {
+                                      size_t live, double gc_cpu_time, double alloc_rate,
+                                      double gc_wall_time) {
   const double alpha_alloc = 0.95;
   const double alpha_gc    = 0.50;
+  // Peak-hold decay: a spike decays to ~60ms after ~40 cycles (a few seconds
+  // of the lusearch burst window), long enough to keep E_stall elevated
+  // across a contention event without permanently overstating it.
+  const double peak_decay  = 0.95;
 
   if (state._avg_live_bytes == 0.0) {
     // First call: seed directly so the estimate isn't dragged toward zero.
-    state._avg_live_bytes  = double(live);
-    state._avg_gc_cpu_time = gc_cpu_time;
-    state._avg_alloc_rate  = alloc_rate;
+    state._avg_live_bytes     = double(live);
+    state._avg_gc_cpu_time    = gc_cpu_time;
+    state._avg_alloc_rate     = alloc_rate;
+    state._peak_gc_wall_time  = gc_wall_time;
+    state._peak_alloc_rate    = alloc_rate;
   } else {
-    state._avg_live_bytes  = alpha_gc    * state._avg_live_bytes  + (1.0 - alpha_gc)    * double(live);
-    state._avg_gc_cpu_time = alpha_gc    * state._avg_gc_cpu_time + (1.0 - alpha_gc)    * gc_cpu_time;
-    state._avg_alloc_rate  = alpha_alloc * state._avg_alloc_rate  + (1.0 - alpha_alloc) * alloc_rate;
+    state._avg_live_bytes     = alpha_gc    * state._avg_live_bytes  + (1.0 - alpha_gc)    * double(live);
+    state._avg_gc_cpu_time    = alpha_gc    * state._avg_gc_cpu_time + (1.0 - alpha_gc)    * gc_cpu_time;
+    state._avg_alloc_rate     = alpha_alloc * state._avg_alloc_rate  + (1.0 - alpha_alloc) * alloc_rate;
+    state._peak_gc_wall_time  = MAX2(peak_decay * state._peak_gc_wall_time, gc_wall_time);
+    state._peak_alloc_rate    = MAX2(peak_decay * state._peak_alloc_rate,   alloc_rate);
   }
 }
 
@@ -717,11 +726,14 @@ size_t ZAdaptiveHeap::compute_heap_size_sqrt(ZHeapResizeMetrics* heap_metrics,
   // g: mutator allocation rate [bytes / wall-clock second].
   const double alloc_rate = heap_metrics->_alloc_rate;
 
+  const double gc_wall_time = cycle_stats._avg_parallelizable_duration
+                            + cycle_stats._avg_serial_time;
+
   ZSqrtSizerState& state = (generation == ZGenerationId::young)
       ? _sqrt_young_state
       : _sqrt_old_state;
 
-  update_sqrt_state(state, live, gc_cpu_time, alloc_rate);
+  update_sqrt_state(state, live, gc_cpu_time, alloc_rate, gc_wall_time);
 
   // c: target GC CPU overhead — same knob as the pressure-based algorithm.
   const double target_gc_overhead = AtomicAccess::load(&ZGCIntensity) / 40.0;
@@ -768,7 +780,13 @@ size_t ZAdaptiveHeap::compute_heap_size_sqrt(ZHeapResizeMetrics* heap_metrics,
 //   E_stall = g * T_gc_wall
 //             — stall-prevention floor: headroom needed to absorb one GC
 //               cycle's worth of allocation without a mutator stall.
-//               T_gc_wall = T_gc_cpu / active_workers + serial_time.
+//               T_gc_wall = observed wall-clock duration of the last cycle
+//                         = avg_parallelizable_duration + avg_serial_time.
+//               Critical under multi-tenant co-location: when another tenant's
+//               mutator preempts this JVM's GC threads, T_gc_cpu shrinks
+//               (less CPU charged) but wall time grows (cycle takes longer).
+//               A synthetic T_gc_cpu/workers + serial term would collapse
+//               E_stall in exactly the regime where it must rise.
 //               Dominates for workloads with g/s > 1 (large live set, slow GC).
 //
 //   E_floor = g * min(T_gc_cpu, T_base) / c,   T_base = c * T_min (50 ms)
@@ -802,11 +820,14 @@ size_t ZAdaptiveHeap::compute_heap_size_combined(ZHeapResizeMetrics* heap_metric
   const double gc_cpu_time  = cycle_stats._last_total_vtime;
   const double alloc_rate   = heap_metrics->_alloc_rate;
 
+  const double gc_wall_time = cycle_stats._avg_parallelizable_duration
+                            + cycle_stats._avg_serial_time;
+
   ZSqrtSizerState& state = (generation == ZGenerationId::young)
       ? _sqrt_young_state
       : _sqrt_old_state;
 
-  update_sqrt_state(state, live, gc_cpu_time, alloc_rate);
+  update_sqrt_state(state, live, gc_cpu_time, alloc_rate, gc_wall_time);
 
   const double target_gc_overhead = AtomicAccess::load(&ZGCIntensity) / 40.0;
 
@@ -820,12 +841,17 @@ size_t ZAdaptiveHeap::compute_heap_size_combined(ZHeapResizeMetrics* heap_metric
     }
   }
 
-  // E_stall: allocation absorbed during one GC wall-clock cycle.
-  // T_gc_wall = T_gc_cpu / active_workers + serial_time.
-  const double active_workers = MAX2(cycle_stats._last_active_workers, 1.0);
-  const double gc_wall_time   = state._avg_gc_cpu_time / active_workers
-                              + cycle_stats._avg_serial_time;
-  const size_t e_stall = size_t(state._avg_alloc_rate * gc_wall_time);
+  // E_stall: allocation absorbed during one worst-case GC wall-clock cycle.
+  // Both factors are peak-hold signals with exponential decay (0.95/cycle ≈
+  // ~40 cycle retention window), not EWMAs. Under multi-tenant co-location
+  // the interesting regime is short bursts where the mutator allocates at
+  // 5–10 GB/s while GC wall time stretches because GC threads are preempted
+  // by the other tenants. Averaging either signal drowns the burst in a sea
+  // of uncontested fast cycles (e.g. lusearch on Linux: median alloc 640
+  // MB/s vs max 6884 MB/s; median wall 15 ms vs max 293 ms). Using the peak
+  // of each keeps E_stall sized for the worst-case burst footprint during
+  // the contention window, preventing heap collapse between spikes.
+  const size_t e_stall = size_t(state._peak_alloc_rate * state._peak_gc_wall_time);
 
   // E_floor: GC-frequency floor with capped T_gc_cpu.
   // On many-core machines T_gc_wall << T_gc_cpu, so E_stall becomes negligible
@@ -869,13 +895,15 @@ size_t ZAdaptiveHeap::compute_heap_size_combined(ZHeapResizeMetrics* heap_metric
     const char* dominant = (e_floor >= e_stall && e_floor >= e_sqrt) ? "floor"
                          : (e_stall >= e_sqrt)                      ? "stall"
                                                                     : "sqrt";
-    log_info(gc, heap)("Combined [%s]: Live: %zuM, AllocRate: %.1fMB/s, "
-                       "GC CPU: %.3fs, Wall: %.3fs, Extra: %zuM -> Capacity: %zuM",
+    log_info(gc, heap)("Combined [%s]: Live: %zuM, AllocRate: %.1fMB/s (peak %.1fMB/s), "
+                       "GC CPU: %.3fs, Wall: %.3fs (peak %.3fs), Extra: %zuM -> Capacity: %zuM",
                        dominant,
                        size_t(state._avg_live_bytes) / M,
                        state._avg_alloc_rate / M,
+                       state._peak_alloc_rate / M,
                        state._avg_gc_cpu_time,
                        gc_wall_time,
+                       state._peak_gc_wall_time,
                        extra / M,
                        result / M);
   }
